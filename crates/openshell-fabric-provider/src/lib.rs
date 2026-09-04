@@ -20,6 +20,9 @@ const PROTOCOL_VERSION: &str = "fabric.environment-provider.v1alpha1";
 const CAPSULE_PROTOCOL_VERSION: &str = "fabric.capsule-control.v1alpha1";
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_EXEC_OUTPUT_BYTES: usize = 3 * 1024 * 1024;
+const MAX_ARTIFACT_BYTES: usize = 256 * 1024;
+const MAX_ARTIFACT_TOTAL_BYTES: usize = 512 * 1024;
+const MAX_ARTIFACT_FILES: usize = 16;
 const DEFAULT_READY_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_DELETE_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_EXEC_TIMEOUT_SECONDS: u64 = 30;
@@ -149,6 +152,10 @@ where
             environment,
             request,
         } => capsule_control(environment, request, factory).await,
+        ProviderOperation::CollectArtifacts {
+            environment,
+            artifacts,
+        } => collect_artifacts(environment, artifacts, factory).await,
         ProviderOperation::Exec {
             environment,
             command,
@@ -185,6 +192,7 @@ where
     validate_profile(&environment)?;
     let connection = OpenShellConnection::from_map(&environment.connection)?;
     let settings = OpenShellSettings::from_map(environment.settings)?;
+    let policy_attached = settings.policy.is_some();
     let client = factory.connect(&connection).await?;
     let health = client.health().await?;
     if health.status != GatewayStatus::Healthy {
@@ -207,6 +215,7 @@ where
                 environment: environment.env,
                 providers: settings.providers,
                 command: settings.command,
+                policy: settings.policy,
             },
         )
         .await?;
@@ -264,7 +273,9 @@ where
             "openshell.sandbox_id": ready.id,
             "openshell.sandbox_name": ready.name,
             "openshell.sandbox_phase": ready.phase.as_str(),
+            "openshell.sandbox_resource_version": ready.resource_version,
             "openshell.capsule_image": settings.image,
+            "openshell.policy_attached": policy_attached,
         },
     }))
 }
@@ -433,6 +444,136 @@ where
     Ok(output)
 }
 
+async fn collect_artifacts<F>(
+    environment: EnvironmentHandle,
+    artifacts: Vec<ArtifactRequest>,
+    factory: &F,
+) -> Result<Value, ProviderError>
+where
+    F: GatewayFactory,
+{
+    if artifacts.is_empty() || artifacts.len() > MAX_ARTIFACT_FILES {
+        return Err(ProviderError::contract(
+            "invalid_artifact_request",
+            format!("artifact count must be between 1 and {MAX_ARTIFACT_FILES}"),
+        ));
+    }
+    let root = environment.artifacts.as_deref().ok_or_else(|| {
+        ProviderError::contract(
+            "artifact_root_unavailable",
+            "environment handle is missing its capsule artifact root",
+        )
+    })?;
+    if !root.starts_with('/') {
+        return Err(ProviderError::contract(
+            "invalid_artifact_request",
+            "capsule artifact root must be absolute",
+        ));
+    }
+    for artifact in &artifacts {
+        validate_artifact_path(&artifact.path)?;
+    }
+
+    let binding = SandboxBinding::from_environment(&environment)?;
+    let client = factory.connect(&binding.connection).await?;
+    let sandbox = client
+        .get(binding.connection.workspace.as_deref(), &binding.name)
+        .await?;
+    binding.verify(&sandbox)?;
+
+    let mut total = 0usize;
+    let mut collected = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let stdin = serde_json::to_vec(&json!({
+            "root": root,
+            "path": artifact.path,
+            "max_bytes": MAX_ARTIFACT_BYTES,
+        }))
+        .map_err(|error| {
+            ProviderError::contract(
+                "artifact_protocol_error",
+                format!("could not encode artifact request: {error}"),
+            )
+        })?;
+        let result = client
+            .exec(
+                binding.connection.workspace.as_deref(),
+                &binding.name,
+                vec![
+                    "fabric-capsule-ctl".to_string(),
+                    "collect-artifact".to_string(),
+                ],
+                ExecRequest {
+                    workdir: environment.workspace.clone(),
+                    environment: HashMap::new(),
+                    timeout: Duration::from_secs(
+                        binding
+                            .connection
+                            .exec_timeout_seconds
+                            .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECONDS),
+                    ),
+                    stdin: Some(stdin),
+                },
+            )
+            .await?;
+        if result.exit_code != 0 {
+            return Err(ProviderError::contract(
+                "artifact_export_failed",
+                format!(
+                    "fabric-capsule-ctl could not export declared artifact `{}`",
+                    artifact.path
+                ),
+            ));
+        }
+        if result.stdout.len() > MAX_ARTIFACT_BYTES {
+            return Err(ProviderError::contract(
+                "artifact_too_large",
+                format!(
+                    "declared artifact `{}` exceeded its size limit",
+                    artifact.path
+                ),
+            ));
+        }
+        total = total.checked_add(result.stdout.len()).ok_or_else(|| {
+            ProviderError::contract("artifact_too_large", "artifact byte count overflowed")
+        })?;
+        if total > MAX_ARTIFACT_TOTAL_BYTES {
+            return Err(ProviderError::contract(
+                "artifact_set_too_large",
+                format!(
+                    "declared artifacts exceeded the {MAX_ARTIFACT_TOTAL_BYTES}-byte total limit"
+                ),
+            ));
+        }
+        collected.push(CollectedArtifact {
+            path: artifact.path,
+            content: result.stdout,
+        });
+    }
+    serde_json::to_value(collected).map_err(|error| {
+        ProviderError::contract(
+            "artifact_protocol_error",
+            format!("could not encode collected artifacts: {error}"),
+        )
+    })
+}
+
+fn validate_artifact_path(path: &str) -> Result<(), ProviderError> {
+    let path = std::path::Path::new(path);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(ProviderError::contract(
+            "invalid_artifact_path",
+            "artifact path must be a non-empty relative path without traversal",
+        ));
+    }
+    Ok(())
+}
+
 async fn release_environment<F>(
     environment: EnvironmentHandle,
     factory: &F,
@@ -530,6 +671,10 @@ enum ProviderOperation {
         environment: EnvironmentHandle,
         request: CapsuleControlRequest,
     },
+    CollectArtifacts {
+        environment: EnvironmentHandle,
+        artifacts: Vec<ArtifactRequest>,
+    },
     Exec {
         environment: EnvironmentHandle,
         command: Vec<String>,
@@ -570,7 +715,21 @@ struct EnvironmentHandle {
     #[serde(default)]
     workspace: Option<String>,
     #[serde(default)]
+    artifacts: Option<String>,
+    #[serde(default)]
     connection: Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactRequest {
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CollectedArtifact {
+    path: String,
+    content: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -809,6 +968,8 @@ struct OpenShellSettings {
     image: String,
     sandbox_name: Option<String>,
     command: Vec<String>,
+    #[serde(skip)]
+    policy: Option<openshell_core::proto::SandboxPolicy>,
     #[serde(default)]
     providers: Vec<String>,
     #[serde(default = "default_ready_timeout_seconds")]
@@ -821,6 +982,24 @@ struct OpenShellSettings {
 
 impl OpenShellSettings {
     fn from_map(map: Map<String, Value>) -> Result<Self, ProviderError> {
+        let mut map = map;
+        let policy = map
+            .remove("policy_yaml")
+            .map(|value| {
+                let yaml = value.as_str().ok_or_else(|| {
+                    ProviderError::contract(
+                        "invalid_settings",
+                        "settings.policy_yaml must be a YAML string",
+                    )
+                })?;
+                openshell_policy::parse_sandbox_policy(yaml).map_err(|error| {
+                    ProviderError::contract(
+                        "invalid_settings",
+                        format!("settings.policy_yaml is invalid: {error}"),
+                    )
+                })
+            })
+            .transpose()?;
         let settings: Self = serde_json::from_value(Value::Object(map)).map_err(|error| {
             ProviderError::contract(
                 "invalid_settings",
@@ -861,15 +1040,21 @@ impl OpenShellSettings {
                 ));
             }
         }
-        Ok(settings)
+        Ok(Self { policy, ..settings })
     }
 }
 
 fn validate_pinned_image(image: &str) -> Result<(), ProviderError> {
+    if let Some(digest) = image.strip_prefix("sha256:")
+        && digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Ok(());
+    }
     let Some((repository, digest)) = image.rsplit_once("@sha256:") else {
         return Err(ProviderError::contract(
             "invalid_settings",
-            "settings.image must be pinned by an `@sha256:` digest",
+            "settings.image must be pinned by an OCI `@sha256:` digest or local Docker `sha256:` image id",
         ));
     };
     if repository.is_empty()
@@ -961,6 +1146,7 @@ struct SandboxCreate {
     environment: HashMap<String, String>,
     providers: Vec<String>,
     command: Vec<String>,
+    policy: Option<openshell_core::proto::SandboxPolicy>,
 }
 
 struct SandboxSnapshot {
@@ -1102,6 +1288,7 @@ impl Gateway for SdkGateway {
             image: Some(request.image),
             labels: request.labels,
             environment: request.environment,
+            policy: request.policy,
             providers: request.providers,
             gpu: false,
             command: request.command,
@@ -1246,7 +1433,43 @@ mod tests {
         .expect_err("mutable image tag must fail");
 
         assert_eq!(error.code(), "invalid_settings");
-        assert!(error.to_string().contains("@sha256:"));
+        assert!(error.to_string().contains("sha256:"));
+    }
+
+    #[test]
+    fn settings_accept_an_immutable_local_docker_image_id() {
+        OpenShellSettings::from_map(Map::from_iter([
+            (
+                "image".to_string(),
+                json!(format!("sha256:{}", "a".repeat(64))),
+            ),
+            (
+                "command".to_string(),
+                json!(["fabric-capsule-runner", "serve"]),
+            ),
+        ]))
+        .expect("immutable local image id");
+    }
+
+    #[test]
+    fn settings_parse_a_creation_time_policy() {
+        let settings = OpenShellSettings::from_map(Map::from_iter([
+            (
+                "image".to_string(),
+                json!(format!("example/capsule@sha256:{}", "a".repeat(64))),
+            ),
+            (
+                "command".to_string(),
+                json!(["fabric-capsule-runner", "serve"]),
+            ),
+            (
+                "policy_yaml".to_string(),
+                json!("version: 1\nfilesystem_policy:\n  include_workdir: true\n"),
+            ),
+        ]))
+        .expect("valid settings");
+
+        assert_eq!(settings.policy.expect("policy").version, 1);
     }
 
     #[test]
@@ -1319,6 +1542,10 @@ mod tests {
                     "command".to_string(),
                     json!(["fabric-capsule-runner", "serve"]),
                 ),
+                (
+                    "policy_yaml".to_string(),
+                    json!("version: 1\nfilesystem_policy:\n  include_workdir: true\n"),
+                ),
             ]),
         };
 
@@ -1331,6 +1558,8 @@ mod tests {
         assert_eq!(output["connection"]["sandbox_id"], "sandbox-id-1");
         assert_eq!(output["connection"]["sandbox_name"], "fabric-sandbox-1");
         assert_eq!(output["metadata"]["openshell.sandbox_phase"], "ready");
+        assert_eq!(output["metadata"]["openshell.sandbox_resource_version"], 1);
+        assert_eq!(output["metadata"]["openshell.policy_attached"], true);
         assert_eq!(
             *calls.lock().expect("calls"),
             [
@@ -1424,6 +1653,51 @@ mod tests {
                 "exec:fabric-demo:fabric-sandbox-1:fabric-capsule-ctl invoke:17",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn artifact_collection_is_typed_bounded_and_identity_checked() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let factory = MockFactory {
+            calls: Arc::clone(&calls),
+            ready_id: "sandbox-id-1",
+        };
+
+        let output = collect_artifacts(
+            environment_handle_fixture(),
+            vec![ArtifactRequest {
+                path: "delivery-receipt.json".to_string(),
+            }],
+            &factory,
+        )
+        .await
+        .expect("collect artifact");
+
+        assert_eq!(output[0]["path"], "delivery-receipt.json");
+        assert_eq!(output[0]["content"], json!([111, 107]));
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            [
+                "connect",
+                "get:fabric-demo:fabric-sandbox-1",
+                "exec:fabric-demo:fabric-sandbox-1:fabric-capsule-ctl collect-artifact:20",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_collection_rejects_traversal_before_connecting() {
+        let error = collect_artifacts(
+            environment_handle_fixture(),
+            vec![ArtifactRequest {
+                path: "../secret".to_string(),
+            }],
+            &NeverConnect,
+        )
+        .await
+        .expect_err("traversal must fail");
+
+        assert_eq!(error.code(), "invalid_artifact_path");
     }
 
     #[test]
@@ -1657,6 +1931,7 @@ mod tests {
             provider: "openshell".to_string(),
             ownership: "fabric_owned".to_string(),
             workspace: Some("/sandbox".to_string()),
+            artifacts: Some("/sandbox/artifacts".to_string()),
             connection: Map::from_iter([
                 ("gateway".to_string(), json!("https://gateway.example")),
                 ("workspace".to_string(), json!("fabric-demo")),

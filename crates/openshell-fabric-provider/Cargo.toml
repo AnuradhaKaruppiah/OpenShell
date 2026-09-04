@@ -16,7 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait = "0.1"
+openshell-core = { path = "../openshell-core" }
 openshell-sdk = { path = "../openshell-sdk" }
+openshell-policy = { path = "../openshell-policy" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

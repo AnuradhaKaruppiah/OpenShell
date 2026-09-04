@@ -808,6 +808,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         image,
         labels,
         environment,
+        policy,
         providers,
         gpu,
         command,
@@ -823,6 +824,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
     proto::CreateSandboxRequest {
         spec: Some(proto::SandboxSpec {
             environment,
+            policy,
             template,
             providers,
             resource_requirements,
@@ -1020,5 +1022,27 @@ mod tests {
         let spec = request.spec.expect("sandbox spec should be present");
         assert_eq!(spec.command, ["/opt/agent binary", "--serve exactly"]);
         assert!(!spec.tty);
+    }
+
+    #[test]
+    fn create_request_preserves_creation_policy() {
+        let policy = proto::SandboxPolicy {
+            version: 1,
+            ..proto::SandboxPolicy::default()
+        };
+        let request = create_sandbox_request(SandboxSpec {
+            policy: Some(policy),
+            ..SandboxSpec::default()
+        });
+
+        assert_eq!(
+            request
+                .spec
+                .expect("sandbox spec")
+                .policy
+                .expect("policy")
+                .version,
+            1
+        );
     }
 }

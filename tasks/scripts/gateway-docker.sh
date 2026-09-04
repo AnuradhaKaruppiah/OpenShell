@@ -16,6 +16,7 @@
 #   OPENSHELL_DOCKER_GATEWAY_NAME=my-docker-gateway mise run gateway:docker
 #   OPENSHELL_SANDBOX_NAMESPACE=my-ns mise run gateway:docker
 #   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:docker
+#   OPENSHELL_GATEWAY_FEATURES=bundled-z3 mise run gateway:docker
 #
 # After the gateway is running, point the CLI at it with either:
 #   openshell --gateway docker-dev <command>
@@ -32,6 +33,7 @@ SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/san
 SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
+GATEWAY_FEATURES="${OPENSHELL_GATEWAY_FEATURES:-}"
 
 normalize_arch() {
   case "$1" in
@@ -158,10 +160,15 @@ CARGO_BUILD_JOBS_ARG=()
 if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
   CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
 fi
+GATEWAY_FEATURES_ARG=()
+if [[ -n "${GATEWAY_FEATURES}" ]]; then
+  GATEWAY_FEATURES_ARG=(--features "${GATEWAY_FEATURES}")
+fi
 
 echo "Building openshell-gateway..."
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-server --bin openshell-gateway
+  -p openshell-server --bin openshell-gateway \
+  ${GATEWAY_FEATURES_ARG[@]+"${GATEWAY_FEATURES_ARG[@]}"}
 
 TLS_DIR="${STATE_DIR}/tls"
 echo "Generating local gateway credentials..."

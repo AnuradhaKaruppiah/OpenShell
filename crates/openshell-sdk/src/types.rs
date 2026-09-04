@@ -106,6 +106,8 @@ pub struct SandboxSpec {
     pub labels: HashMap<String, String>,
     /// Environment variables injected into the sandbox runtime.
     pub environment: HashMap<String, String>,
+    /// Sandbox policy applied at creation time, including static filesystem and process controls.
+    pub policy: Option<proto::SandboxPolicy>,
     /// Provider names to attach.
     pub providers: Vec<String>,
     /// Request a GPU. Driver-specific device selection is configured via
