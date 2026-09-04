@@ -17,6 +17,7 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 const PROTOCOL_VERSION: &str = "fabric.environment-provider.v1alpha1";
+const CAPSULE_PROTOCOL_VERSION: &str = "fabric.capsule-control.v1alpha1";
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_EXEC_OUTPUT_BYTES: usize = 3 * 1024 * 1024;
 const DEFAULT_READY_TIMEOUT_SECONDS: u64 = 60;
@@ -144,6 +145,10 @@ where
         ProviderOperation::Inspect { environment } => {
             inspect_environment(environment, factory).await
         }
+        ProviderOperation::CapsuleControl {
+            environment,
+            request,
+        } => capsule_control(environment, request, factory).await,
         ProviderOperation::Exec {
             environment,
             command,
@@ -353,6 +358,81 @@ where
     }))
 }
 
+async fn capsule_control<F>(
+    environment: EnvironmentHandle,
+    request: CapsuleControlRequest,
+    factory: &F,
+) -> Result<Value, ProviderError>
+where
+    F: GatewayFactory,
+{
+    request.validate(&environment)?;
+    let binding = SandboxBinding::from_environment(&environment)?;
+    let client = factory.connect(&binding.connection).await?;
+    let sandbox = client
+        .get(binding.connection.workspace.as_deref(), &binding.name)
+        .await?;
+    binding.verify(&sandbox)?;
+    let stdin = serde_json::to_vec(&request).map_err(|error| {
+        ProviderError::contract(
+            "capsule_protocol_error",
+            format!("could not encode capsule request: {error}"),
+        )
+    })?;
+    let timeout = request.timeout_seconds.checked_add(5).ok_or_else(|| {
+        ProviderError::contract("invalid_capsule_request", "capsule timeout is too large")
+    })?;
+    let result = client
+        .exec(
+            binding.connection.workspace.as_deref(),
+            &binding.name,
+            vec!["fabric-capsule-ctl".to_string(), request.operation.clone()],
+            ExecRequest {
+                workdir: environment.workspace,
+                environment: HashMap::new(),
+                timeout: Duration::from_secs(timeout),
+                stdin: Some(stdin),
+            },
+        )
+        .await?;
+    if result.stdout.len().saturating_add(result.stderr.len()) > MAX_EXEC_OUTPUT_BYTES {
+        return Err(ProviderError::contract(
+            "exec_output_too_large",
+            format!("buffered exec output exceeds the {MAX_EXEC_OUTPUT_BYTES}-byte limit"),
+        ));
+    }
+    if result.exit_code != 0 {
+        let diagnostics = String::from_utf8_lossy(&result.stderr);
+        return Err(ProviderError::contract(
+            "capsule_control_failed",
+            if diagnostics.trim().is_empty() {
+                format!("fabric-capsule-ctl exited with {}", result.exit_code)
+            } else {
+                format!(
+                    "fabric-capsule-ctl exited with {}: {}",
+                    result.exit_code,
+                    diagnostics.trim()
+                )
+            },
+        ));
+    }
+    let output: Value = serde_json::from_slice(&result.stdout).map_err(|error| {
+        ProviderError::contract(
+            "capsule_protocol_error",
+            format!("fabric-capsule-ctl returned invalid JSON: {error}"),
+        )
+    })?;
+    let identity: CapsuleControlResponseIdentity =
+        serde_json::from_value(output.clone()).map_err(|error| {
+            ProviderError::contract(
+                "capsule_protocol_error",
+                format!("capsule response did not match the control contract: {error}"),
+            )
+        })?;
+    identity.validate(&request)?;
+    Ok(output)
+}
+
 async fn release_environment<F>(
     environment: EnvironmentHandle,
     factory: &F,
@@ -446,6 +526,10 @@ enum ProviderOperation {
     Inspect {
         environment: EnvironmentHandle,
     },
+    CapsuleControl {
+        environment: EnvironmentHandle,
+        request: CapsuleControlRequest,
+    },
     Exec {
         environment: EnvironmentHandle,
         command: Vec<String>,
@@ -480,10 +564,106 @@ struct EnvironmentPlan {
 
 #[derive(Debug, Deserialize)]
 struct EnvironmentHandle {
+    environment_id: String,
     provider: String,
     ownership: String,
     #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
     connection: Map<String, Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CapsuleControlRequest {
+    protocol_version: String,
+    operation_id: String,
+    environment_id: String,
+    runtime_id: String,
+    timeout_seconds: u64,
+    operation: String,
+    #[serde(flatten)]
+    payload: Map<String, Value>,
+}
+
+impl CapsuleControlRequest {
+    fn validate(&self, environment: &EnvironmentHandle) -> Result<(), ProviderError> {
+        if self.protocol_version != CAPSULE_PROTOCOL_VERSION {
+            return Err(ProviderError::contract(
+                "capsule_protocol_mismatch",
+                format!(
+                    "expected `{CAPSULE_PROTOCOL_VERSION}` but received `{}`",
+                    self.protocol_version
+                ),
+            ));
+        }
+        if self.operation_id.trim().is_empty()
+            || self.environment_id.trim().is_empty()
+            || self.runtime_id.trim().is_empty()
+            || self.timeout_seconds == 0
+        {
+            return Err(ProviderError::contract(
+                "invalid_capsule_request",
+                "capsule identity and timeout fields must be non-empty",
+            ));
+        }
+        if !matches!(self.operation.as_str(), "start" | "invoke" | "stop") {
+            return Err(ProviderError::contract(
+                "invalid_capsule_request",
+                format!("unsupported capsule operation `{}`", self.operation),
+            ));
+        }
+        if self.environment_id != environment.environment_id {
+            return Err(ProviderError::contract(
+                "capsule_environment_mismatch",
+                "capsule request environment id does not match the environment handle",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CapsuleControlResponseIdentity {
+    protocol_version: String,
+    operation_id: String,
+    environment_id: String,
+    runtime_id: String,
+    operation: String,
+    status: String,
+}
+
+impl CapsuleControlResponseIdentity {
+    fn validate(&self, request: &CapsuleControlRequest) -> Result<(), ProviderError> {
+        for (field, expected, actual) in [
+            (
+                "protocol_version",
+                CAPSULE_PROTOCOL_VERSION,
+                self.protocol_version.as_str(),
+            ),
+            ("operation_id", &request.operation_id, &self.operation_id),
+            (
+                "environment_id",
+                &request.environment_id,
+                &self.environment_id,
+            ),
+            ("runtime_id", &request.runtime_id, &self.runtime_id),
+            ("operation", &request.operation, &self.operation),
+        ] {
+            if expected != actual {
+                return Err(ProviderError::contract(
+                    "capsule_correlation_mismatch",
+                    format!("capsule response `{field}` did not match the request"),
+                ));
+            }
+        }
+        if !matches!(self.status.as_str(), "succeeded" | "failed") {
+            return Err(ProviderError::contract(
+                "capsule_protocol_error",
+                "capsule response status must be `succeeded` or `failed`",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1211,6 +1391,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capsule_control_executes_only_the_typed_correlated_operation() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let factory = MockFactory {
+            calls: Arc::clone(&calls),
+            ready_id: "sandbox-id-1",
+        };
+        let request = CapsuleControlRequest {
+            protocol_version: CAPSULE_PROTOCOL_VERSION.to_string(),
+            operation_id: "operation-1".to_string(),
+            environment_id: "environment-1".to_string(),
+            runtime_id: "runtime-1".to_string(),
+            timeout_seconds: 12,
+            operation: "invoke".to_string(),
+            payload: Map::from_iter([("lifecycle".to_string(), json!({"operation": "invoke"}))]),
+        };
+
+        let output = capsule_control(environment_handle_fixture(), request, &factory)
+            .await
+            .expect("capsule control");
+
+        assert_eq!(output["operation_id"], "operation-1");
+        assert_eq!(output["environment_id"], "environment-1");
+        assert_eq!(output["runtime_id"], "runtime-1");
+        assert_eq!(output["operation"], "invoke");
+        assert_eq!(output["status"], "succeeded");
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            [
+                "connect",
+                "get:fabric-demo:fabric-sandbox-1",
+                "exec:fabric-demo:fabric-sandbox-1:fabric-capsule-ctl invoke:17",
+            ]
+        );
+    }
+
+    #[test]
+    fn capsule_control_rejects_an_uncorrelated_response() {
+        let request = CapsuleControlRequest {
+            protocol_version: CAPSULE_PROTOCOL_VERSION.to_string(),
+            operation_id: "operation-1".to_string(),
+            environment_id: "environment-1".to_string(),
+            runtime_id: "runtime-1".to_string(),
+            timeout_seconds: 12,
+            operation: "invoke".to_string(),
+            payload: Map::new(),
+        };
+        let response = CapsuleControlResponseIdentity {
+            protocol_version: CAPSULE_PROTOCOL_VERSION.to_string(),
+            operation_id: "operation-1".to_string(),
+            environment_id: "environment-1".to_string(),
+            runtime_id: "another-runtime".to_string(),
+            operation: "invoke".to_string(),
+            status: "succeeded".to_string(),
+        };
+
+        let error = response
+            .validate(&request)
+            .expect_err("runtime mismatch must fail closed");
+
+        assert_eq!(error.code(), "capsule_correlation_mismatch");
+    }
+
+    #[tokio::test]
     async fn prepare_cleans_up_when_readiness_returns_a_different_identity() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let factory = MockFactory {
@@ -1357,9 +1600,30 @@ mod tests {
                 command.join(" "),
                 request.timeout.as_secs()
             ));
+            let stdout = if matches!(
+                command.get(1).map(String::as_str),
+                Some("start" | "invoke" | "stop")
+            ) {
+                let request: Value = serde_json::from_slice(
+                    request.stdin.as_deref().expect("capsule request stdin"),
+                )
+                .expect("capsule request JSON");
+                serde_json::to_vec(&json!({
+                    "protocol_version": CAPSULE_PROTOCOL_VERSION,
+                    "operation_id": request["operation_id"],
+                    "environment_id": request["environment_id"],
+                    "runtime_id": request["runtime_id"],
+                    "operation": request["operation"],
+                    "status": "succeeded",
+                    "output": null,
+                }))
+                .expect("capsule response JSON")
+            } else {
+                b"ok".to_vec()
+            };
             Ok(ExecResponse {
                 exit_code: 0,
-                stdout: b"ok".to_vec(),
+                stdout,
                 stderr: Vec::new(),
             })
         }
@@ -1389,8 +1653,10 @@ mod tests {
 
     fn environment_handle_fixture() -> EnvironmentHandle {
         EnvironmentHandle {
+            environment_id: "environment-1".to_string(),
             provider: "openshell".to_string(),
             ownership: "fabric_owned".to_string(),
+            workspace: Some("/sandbox".to_string()),
             connection: Map::from_iter([
                 ("gateway".to_string(), json!("https://gateway.example")),
                 ("workspace".to_string(), json!("fabric-demo")),

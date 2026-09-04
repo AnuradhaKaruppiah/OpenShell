@@ -12,5 +12,13 @@ buffered exec with bounded published output, and owned deletion. It accepts only
 and reads gateway credentials from environment-variable names supplied in
 `environment.connection`. Literal token fields are rejected.
 
-This provider does not yet run a Fabric adapter. The capsule-control transport
-that binds adapter `start`, `invoke`, and `stop` is the next integration layer.
+The provider also implements the typed `capsule_control` operation. It verifies
+the bound sandbox identity, executes only
+`fabric-capsule-ctl start|invoke|stop`, and rejects uncorrelated capsule
+responses. The resident `fabric-capsule-runner` and configured Fabric adapter
+must be installed in the digest-pinned capsule image. Environment release
+remains a separate caller operation; runtime stop never deletes the sandbox.
+
+This first capsule profile is buffered and sequential. It deliberately omits
+generic shell exposure, streaming, reconnect, cancellation, and artifact
+transfer.
