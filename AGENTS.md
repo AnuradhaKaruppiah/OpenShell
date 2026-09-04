@@ -41,6 +41,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-otel-test-support/` | OpenTelemetry test support | Shared loopback OTLP collector fixture for tracing tests |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
 | `crates/openshell-extension-core/` | Extension core | Shared extension identity, JWT claims, bearer-token rotation, and TLS transport primitives |
+| `crates/openshell-fabric-provider/` | NeMo Fabric environment provider | Optional out-of-process bridge from NeMo Fabric's normalized environment contract to the OpenShell SDK |
 | `crates/openshell-sdk/` | Shared client SDK | Async Rust gateway client (gRPC transport, TLS, OIDC refresh, edge tunnel); consumed by CLI, TUI, and `@openshell/sdk` |
 | `crates/openshell-providers/` | Provider management | Credential provider backends |
 | `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
